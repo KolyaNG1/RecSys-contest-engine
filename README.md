@@ -214,74 +214,140 @@ jupyter notebook
 
 ### 1) `IALSCandidateGenerator` (`name = "ials"`)
 
-Что делает:
+Назначение: user-to-item retrieval на latent-факторах.
 
-- строит user-item матрицу взаимодействий;
+Параметры конструктора:
+
+- `factors`, `iterations`, `alpha`, `regularization`, `file_prefix`.
+
+`fit(train_data)`:
+
+- строит user-item CSR-матрицу из `uid`, `item_id`;
 - обучает `implicit.als.AlternatingLeastSquares`;
-- сохраняет user/item факторы и маппинги;
-- строит Faiss-индекс по item-векторам;
-- для батча пользователей делает ANN-поиск top-N айтемов по inner product.
+- сохраняет:
+  - `user_map.parquet`, `item_map.parquet`;
+  - `user_factors.npy`, `item_factors.npy`;
+  - Faiss-индекс `index.bin` по item-факторам.
 
-Сильная сторона:
+`startup()`:
 
-- персонализированный retrieval с хорошим базовым покрытием.
+- загружает маппинги и факторы в память;
+- поднимает Faiss-индекс для ANN-поиска.
+
+`generate(context, num_candidates)`:
+
+- матчится список `target_users` с известными `uid` из `user_map`;
+- делает батчевый nearest-neighbors поиск top-K по user-векторам;
+- возвращает `uid`, `item_id`, `score`, `source`.
 
 ### 2) `IALSItemToItemGenerator` (`name = "ials_i2i"`)
 
-Что делает:
+Назначение: item-to-item retrieval от последних взаимодействий пользователя.
 
-- берет последние лайки пользователя (`n_last_items`);
-- для каждого лайкнутого трека ищет похожие в Faiss по iALS item-факторам;
-- объединяет результаты, дедуплицирует `(uid, item_id)`, оставляет top-N на пользователя.
+Параметры конструктора:
 
-Сильная сторона:
+- `n_last_items`, `n_similar_per_item`, `file_prefix`.
 
-- добавляет "локальную" похожесть относительно недавней истории пользователя.
+Зависимости:
+
+- использует артефакты базового iALS (`item_factors.npy`, `item_map.parquet`, Faiss-индекс).
+
+`startup()`:
+
+- загружает item-факторы и индекс;
+- строит словарь `item_id -> factor_index`.
+
+`generate(context, num_candidates)`:
+
+- выбирает последние `n_last_items` из `history_likes` для каждого `uid`;
+- для каждого item делает поиск похожих в индексе;
+- объединяет результаты, делает `unique(uid, item_id)`, сортирует по score, режет top-N на пользователя;
+- возвращает `uid`, `item_id`, `score`, `source`.
 
 ### 3) `GlobalPopularityGenerator` (`name = "global_pop"`)
 
-Что делает:
+Назначение: неперсонализированный retrieval по глобальной частоте лайков.
 
-- считает глобальный топ треков по частоте лайков;
-- на инференсе кросс-джойнит top-список со всеми целевыми пользователями.
+Параметры конструктора:
 
-Сильная сторона:
+- `top_n`.
 
-- стабильный бэкап-кандидатинг и хороший холодный baseline.
+`fit(train_data)`:
+
+- считает частоты `item_id`;
+- сохраняет top-`top_n` в `top_items.parquet` с колонками `item_id`, `score`.
+
+`generate(context, num_candidates)`:
+
+- делает cross join `target_users x top_items`;
+- возвращает `uid`, `item_id`, `score`, `source`.
 
 ### 4) `ArtistPopularityGenerator` (`name = "artist_pop"`)
 
-Что делает:
+Назначение: retrieval по предпочтительным артистам пользователя.
 
-- по train-истории строит топ треков каждого артиста;
-- по истории батча определяет любимых артистов пользователя (`top_n_artists`);
-- рекомендует популярные треки этих артистов (`tracks_per_artist`).
+Параметры конструктора:
 
-Сильная сторона:
+- `artist_mapping`, `top_n_artists`, `tracks_per_artist`.
 
-- персонализация через вкусы по артистам, особенно полезно при короткой истории.
+`fit(train_data)`:
+
+- сохраняет `artist_mapping.parquet`;
+- считает топ треков по каждому артисту;
+- сохраняет `artist_top_tracks.parquet`.
+
+`generate(context, num_candidates)`:
+
+- по `history_likes` батча считает top-`top_n_artists` артистов пользователя;
+- джойнит с `artist_top_tracks` и получает кандидатов;
+- возвращает `uid`, `item_id`, `score` (`artist_score`), `source`.
 
 ### 5) `CoVisitationGenerator` (`name = "covisitation"`)
 
-Что делает:
+Назначение: item-item retrieval через co-occurrence в истории взаимодействий.
 
-- строит разреженную матрицу user-item;
-- считает item-item граф `X^T X`;
-- обрезает до `top_k_similar` соседей на трек и сохраняет sparse similarity matrix;
-- на батче умножает историю пользователя на item-item матрицу и получает score кандидатов.
+Параметры конструктора:
 
-Сильная сторона:
+- `top_k_similar`, `history_depth`, `file_prefix`.
 
-- быстро поднимает кандидатов по совместной встречаемости без latent-факторов.
+`fit(train_data)`:
+
+- строит CSR user-item матрицу;
+- считает `G = X^T X`, зануляет диагональ;
+- для каждой строки оставляет top-`top_k_similar` соседей;
+- сохраняет:
+  - `similarity_matrix.npz`;
+  - `item_map.parquet`.
+
+`generate(context, num_candidates)`:
+
+- собирает историю батча глубиной `history_depth`;
+- кодирует ее как `X_batch`;
+- считает `Scores = X_batch * similarity_matrix`;
+- извлекает top-N по каждому пользователю;
+- возвращает `uid`, `item_id`, `score`, `source`.
 
 ### 6) `EASEGenerator` (`name = "ease"`)
 
-Что делает:
+Назначение: линейный item-item retrieval по матрице весов EASE.
 
-- ограничивает пространство топ-популярными айтемами (`top_k_items`);
-- строит Gram-матрицу и рассчитывает веса EASE (линейная модель item-item);
-- на инференсе умножает батч-историю на матрицу весов, получает релевантности и top-N.
+Параметры конструктора:
 
-Сильная сторона:
+- `top_k_items`, `l2_reg`, `file_prefix`.
 
-- мощный item-item сигнал с хорошим качеством на implicit feedback.
+`fit(train_data)`:
+
+- выбирает top-`top_k_items` по популярности;
+- строит CSR user-item матрицу в этом подпространстве;
+- считает Gram-матрицу `G = X^T X`, добавляет `l2_reg` на диагональ;
+- инвертирует `G`, строит матрицу весов `B`;
+- сохраняет:
+  - `ease_weights.npy`;
+  - `item_map.parquet`.
+
+`generate(context, num_candidates)`:
+
+- кодирует историю батча в матрицу `X_batch`;
+- считает релевантности `scores = X_batch * B` (чанками);
+- извлекает top-N по каждому пользователю;
+- возвращает `uid`, `item_id`, `score`, `source`.
